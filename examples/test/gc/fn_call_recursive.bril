@@ -1,0 +1,19 @@
+@main {
+  one: int = const 1;
+  ptr: ptr<int> = alloc one;
+  call @new_fn;
+  ret;
+}
+
+@new_fn {
+  one: int = const 1;
+  ptr2: ptr<int> = alloc one;
+  call @new_fn2;
+  ret;
+}
+
+@new_fn2 {
+  one: int = const 1;
+  ptr3: ptr<int> = alloc one;
+  ret;
+}

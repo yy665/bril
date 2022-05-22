@@ -101,6 +101,50 @@ export class Heap<X> {
     }
 }
 
+class GarbageCollector {
+  private refcount : Map<Key, number>;
+  private heap : Heap<Value>;
+
+  constructor(heap : Heap<Value>){
+    this.refcount = new Map();
+    this.heap = heap;
+  }
+
+  inc(key: Key) {
+    if(this.refcount.has(key)){
+      let count = this.refcount.get(key);
+      if(count != undefined){
+        this.refcount.set(key, count+1);
+      }
+    } else {
+      this.refcount.set(key, 1);
+    }
+  }
+
+  dec(key: Key) {
+    let count = this.refcount.get(key);
+    if(count != undefined){
+      this.refcount.set(key, count-1);
+      if(count == 1){
+        this.heap.free(key);
+        this.refcount.delete(key);
+      }
+    }
+  }
+  
+  inc_all(){
+    this.refcount.forEach((v, k) => {
+      this.inc(k);
+    })
+  }
+
+  dec_all(){
+    this.refcount.forEach((v, k) => {
+      this.dec(k);
+    })
+  }
+
+}
 const argCounts: {[key in bril.OpCode]: number | null} = {
   add: 2,
   mul: 2,
@@ -310,6 +354,8 @@ type State = {
 
   // For speculation: the state at the point where speculation began.
   specparent: State | null,
+
+  gc: GarbageCollector,
 }
 
 /**
@@ -348,6 +394,7 @@ function evalCall(instr: bril.Operation, state: State): Action {
   // Invoke the interpreter on the function.
   let newState: State = {
     env: newEnv,
+    gc: state.gc,
     heap: state.heap,
     funcs: state.funcs,
     icount: state.icount,
@@ -355,6 +402,9 @@ function evalCall(instr: bril.Operation, state: State): Action {
     curlabel: null,
     specparent: null,  // Speculation not allowed.
   }
+
+  newState.gc.inc_all();
+
   let retVal = evalFunc(func, newState);
   state.icount = newState.icount;
 
@@ -389,6 +439,8 @@ function evalCall(instr: bril.Operation, state: State): Action {
     }
     state.env.set(instr.dest, retVal);
   }
+
+  state.gc.dec_all();
   return NEXT;
 }
 
@@ -436,6 +488,9 @@ function evalInstr(instr: bril.Instruction, state: State): Action {
 
   case "id": {
     let val = getArgument(instr, state.env, 0);
+    if (val.hasOwnProperty("loc")) {
+      state.gc.inc((val as Pointer).loc);
+    }
     state.env.set(instr.dest, val);
     return NEXT;
   }
@@ -593,9 +648,14 @@ function evalInstr(instr: bril.Instruction, state: State): Action {
   case "ret": {
     let args = instr.args || [];
     if (args.length == 0) {
+      state.gc.dec_all();
       return {"action": "end", "ret": null};
     } else if (args.length == 1) {
       let val = get(state.env, args[0]);
+      if (val.hasOwnProperty("loc")) {
+        state.gc.inc((val as Pointer).loc);
+      }
+      state.gc.dec_all();
       return {"action": "end", "ret": val};
     } else {
       throw error(`ret takes 0 or 1 argument(s); got ${args.length}`);
@@ -617,11 +677,19 @@ function evalInstr(instr: bril.Instruction, state: State): Action {
       throw error(`cannot allocate non-pointer type ${instr.type}`);
     }
     let ptr = alloc(typ, Number(amt), state.heap);
+    
+    let old_value = state.env.get(instr.dest);
+    if(old_value != undefined && old_value.hasOwnProperty('loc')){
+      state.gc.dec((old_value as Pointer).loc);
+    }
+
     state.env.set(instr.dest, ptr);
+    state.gc.inc(ptr.loc);
     return NEXT;
   }
 
   case "free": {
+    // Free is kept for debugging purpose
     let val = getPtr(instr, state.env, 0);
     state.heap.free(val.loc);
     return NEXT;
@@ -647,6 +715,13 @@ function evalInstr(instr: bril.Instruction, state: State): Action {
   case "ptradd": {
     let ptr = getPtr(instr, state.env, 0)
     let val = getInt(instr, state.env, 1)
+
+    let old_value = state.env.get(instr.dest);
+    if(old_value != undefined && old_value.hasOwnProperty('loc')){
+      state.gc.dec((old_value as Pointer).loc);
+    }
+    state.gc.inc(ptr.loc);
+
     state.env.set(instr.dest, { loc: ptr.loc.add(Number(val)), type: ptr.type })
     return NEXT;
   }
@@ -816,6 +891,7 @@ function parseMainArguments(expected: bril.Argument[], args: string[]) : Env {
 
 function evalProg(prog: bril.Program) {
   let heap = new Heap<Value>()
+  let gc = new GarbageCollector(heap)
   let main = findFunc("main", prog.functions);
   if (main === null) {
     console.warn(`no main function defined, doing nothing`);
@@ -838,13 +914,16 @@ function evalProg(prog: bril.Program) {
   let state: State = {
     funcs: prog.functions,
     heap,
+    gc,
     env: newEnv,
     icount: BigInt(0),
     lastlabel: null,
     curlabel: null,
     specparent: null,
   }
+  state.gc.inc_all();
   evalFunc(main, state);
+  state.gc.dec_all();
 
   if (!heap.isEmpty()) {
     throw error(`Some memory locations have not been freed by end of execution.`);
